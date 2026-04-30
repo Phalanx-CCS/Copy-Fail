@@ -124,7 +124,7 @@ def probe_af_alg() -> dict:
     # --- Step 2: bind with the vulnerable algorithm template ---
     try:
         addr = build_sockaddr_alg(VULNERABLE_SALG_TYPE, VULNERABLE_SALG_NAME)
-        fd.bind(addr)
+        fd.bind(("hash", "sha256"))
         # If we reach here the path is reachable
         result["reachable"] = True
         result["reason"] = "Socket created and bound – AF_ALG reachable"
