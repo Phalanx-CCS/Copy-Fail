@@ -10,8 +10,6 @@ License : MIT
 """
 
 import sys
-import os
-import struct
 import socket
 import errno
 import platform
@@ -19,23 +17,14 @@ import platform
 # ---------------------------------------------------------------------------
 # AF_ALG constants (not exposed in Python's socket module by default)
 # ---------------------------------------------------------------------------
-AF_ALG       = 38
-SOL_ALG      = 279
-ALG_SET_KEY  = 1
-ALG_SET_IV   = 2
+AF_ALG = 38
 
-# The exact algorithm template the vulnerability relies on
-VULNERABLE_SALG_TYPE = b"aead"
-VULNERABLE_SALG_NAME = b"authencesn(hmac(sha256),cbc(aes))"
-
-# struct sockaddr_alg layout:
-#   uint16  salg_family
-#   char[14] salg_type
-#   uint32  salg_feat
-#   uint32  salg_mask
-#   char[64] salg_name
-SOCKADDR_ALG_FMT = "H14sII64s"
-SOCKADDR_ALG_SIZE = struct.calcsize(SOCKADDR_ALG_FMT)
+# The exact algorithm template the vulnerability relies on.
+# CVE-2026-31431 abuses the in-place AEAD optimization introduced in the
+# algif_aead module (commit merged August 2017) to land a 4-byte controlled
+# write into the page cache of any readable file without owning it.
+VULNERABLE_SALG_TYPE = "aead"
+VULNERABLE_SALG_NAME = "authencesn(hmac(sha256),cbc(aes))"
 
 # ---------------------------------------------------------------------------
 # Colour helpers (degrade gracefully if stdout is not a tty)
@@ -77,57 +66,55 @@ def parse_kernel_version(release: str):
 
 def check_kernel_range(release: str) -> bool:
     """
-    CVE-2026-31431 affects kernels >= 4.14 and < the patched version.
+    CVE-2026-31431 affects kernels >= 4.14 (algif_aead in-place opt introduced
+    August 2017) up to but not including the patched versions.
+    Patch commit: a664bf3d603d (targeting 6.8.x / 6.6.x LTS / 6.1.x LTS).
     Returns True if the kernel falls in the potentially affected range.
-    Patch commit: a664bf3d603d (expected in 6.8.x / 6.6.x LTS / 6.1.x LTS).
     """
     major, minor, _ = parse_kernel_version(release)
-    # Rough check: 4.14 <= kernel < 6.9
-    if (major, minor) >= (4, 14):
-        return True
-    return False
+    return (major, minor) >= (4, 14)
 
 # ---------------------------------------------------------------------------
 # Core reachability probe
 # ---------------------------------------------------------------------------
 
-def build_sockaddr_alg(salg_type: bytes, salg_name: bytes) -> bytes:
-    return struct.pack(
-        SOCKADDR_ALG_FMT,
-        AF_ALG,
-        salg_type.ljust(14, b"\x00"),
-        0,   # salg_feat
-        0,   # salg_mask
-        salg_name.ljust(64, b"\x00"),
-    )
-
 def probe_af_alg() -> dict:
     """
-    Attempt to create and bind an AF_ALG socket using the vulnerable algorithm.
-    Returns a result dict with keys: reachable (bool), reason (str), errno_val (int|None).
+    Attempt to create an AF_ALG socket and bind it to the specific algorithm
+    template that CVE-2026-31431 relies on.
+
+    CPython's AF_ALG socket.bind() expects a 4-tuple:
+        (type: str, name: str, feat: int, mask: int)
+    It handles sockaddr_alg struct packing internally.
+
+    Returns a result dict:
+        reachable  (bool)     – True if the attack surface is accessible
+        reason     (str)      – Human-readable explanation
+        errno_val  (int|None) – errno from the failing syscall, if any
     """
     result = {"reachable": False, "reason": "", "errno_val": None}
 
-    # --- Step 1: create the socket ---
+    # --- Step 1: create the AF_ALG socket ---
     try:
         fd = socket.socket(AF_ALG, socket.SOCK_SEQPACKET, 0)
     except OSError as e:
         result["errno_val"] = e.errno
         if e.errno == errno.EAFNOSUPPORT:
-            result["reason"] = "AF_ALG not supported – module not loaded"
+            result["reason"] = "AF_ALG not supported – kernel module not loaded"
         elif e.errno == errno.EPERM:
             result["reason"] = "Permission denied creating AF_ALG socket (MAC policy active)"
         else:
             result["reason"] = f"Socket creation failed (errno {e.errno}: {e.strerror})"
         return result
 
-    # --- Step 2: bind with the vulnerable algorithm template ---
+    # --- Step 2: bind to the vulnerable algorithm template ---
     try:
-        addr = build_sockaddr_alg(VULNERABLE_SALG_TYPE, VULNERABLE_SALG_NAME)
-        fd.bind(("hash", "sha256"))
-        # If we reach here the path is reachable
+        fd.bind((VULNERABLE_SALG_TYPE, VULNERABLE_SALG_NAME, 0, 0))
         result["reachable"] = True
-        result["reason"] = "Socket created and bound – AF_ALG reachable"
+        result["reason"] = (
+            f"Bound to {VULNERABLE_SALG_TYPE}/{VULNERABLE_SALG_NAME} – "
+            "vulnerable algorithm reachable by unprivileged user"
+        )
     except OSError as e:
         result["errno_val"] = e.errno
         if e.errno in (errno.ENOENT, errno.ENODEV, errno.EINVAL):
@@ -166,11 +153,12 @@ def print_banner() -> None:
 def print_report(kernel: str, in_range: bool, probe: dict) -> None:
     print(f"\n{BOLD('Kernel release:')} {kernel}")
     range_label = (
-        YELLOW("Potentially affected range") if in_range
+        YELLOW("Potentially affected range")
+        if in_range
         else GREEN("Outside documented affected range")
     )
     print(f"{BOLD('Version range : ')} {range_label}")
-    print(f"{BOLD('AF_ALG target : ')} {VULNERABLE_SALG_NAME.decode()}")
+    print(f"{BOLD('AF_ALG target : ')} {VULNERABLE_SALG_NAME}")
     print()
 
     if probe["reachable"]:
@@ -205,13 +193,13 @@ def main() -> int:
     print_banner()
     check_platform()
 
-    kernel  = get_kernel_version()
+    kernel   = get_kernel_version()
     in_range = check_kernel_range(kernel)
-    probe   = probe_af_alg()
+    probe    = probe_af_alg()
 
     print_report(kernel, in_range, probe)
 
-    # Exit 1 if reachable (useful for CI/scripting), 0 if safe
+    # Exit code 1 = reachable (useful for CI/scripting integration), 0 = safe
     return 1 if probe["reachable"] else 0
 
 if __name__ == "__main__":
